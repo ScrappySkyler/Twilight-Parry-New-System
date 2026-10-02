@@ -1,7 +1,7 @@
 {
-  "id": "com.example.my_mod",
-  "name": "My Mod",
-  "version": "@PROJECT_VERSION@",
-  "author": "You",
-  "description": "An example Dusklight mod"
+  "id": "com.usuario.parry",
+  "name": "Parry Bar",
+  "version": "0.2.0",
+  "author": "Tu nombre",
+  "description": "Sistema de parry estilo Sekiro. Empuja el escudo justo antes del golpe enemigo para hacer parry: el enemigo sigue atacando, pero una barra blanca sobre su cabeza sube con cada parry. Al llenarse (3 parries) queda aturdido y puedes encadenar dos tajos relampago (Mortal Draw) con B; despues la barra se reinicia. Quita el escudo automatico al fijar enemigos (mantener R + Z para activarlo o desactivarlo)."
 }
