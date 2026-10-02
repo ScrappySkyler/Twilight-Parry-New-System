@@ -35,15 +35,9 @@
 #endif
 
 #if AUDIO_SCAN
-#include <mutex>
-#include <set>
 #include <map>
 #include <string>
 #include <cstdio>
-#include <atomic>
-#include "JSystem/JAudio2/JASWaveBank.h"
-#include "JSystem/JAudio2/JASBasicWaveBank.h"
-#include "JSystem/JAudio2/JASSimpleWaveBank.h"
 #endif
 
 DEFINE_MOD();
@@ -72,8 +66,8 @@ DEFINE_HOOK(&daAlink_c::setCutDash, CutDash);
 DEFINE_HOOK(&daAlink_c::draw, LinkDraw);
 #endif
 #if AUDIO_SCAN
-DEFINE_HOOK(&JASBasicWaveBank::getWaveHandle, ScanBasicWave);
-DEFINE_HOOK(&JASSimpleWaveBank::getWaveHandle, ScanSimpleWave);
+DEFINE_HOOK_SYMBOL("JASBasicWaveBank::getWaveHandle", void*(void*, uint32_t), ScanBasicWave);
+DEFINE_HOOK_SYMBOL("JASSimpleWaveBank::getWaveHandle", void*(void*, uint32_t), ScanSimpleWave);
 #endif
 
 // ---- Ajustes (ticks de logica: 30 por segundo) ----
@@ -207,53 +201,62 @@ static void on_shield_guard_post(ModContext*, void* args, void*, void*) {
 }
 
 // ======================= HERRAMIENTA: BUSCAR ID DE SONIDO =======================
-// Temporal. Mantener R y presionar:
-//   Z = reproduce el sonido MIDNA_JUMP y anota que muestras de audio se piden
-//   Y = reproduce el sonido TITLE_ENTER y anota lo mismo
-//   X = no reproduce nada (linea base, para descartar la musica y el ambiente)
+// Temporal. Mantener R y presionar Y (varias veces). Cada pulsacion hace una prueba distinta:
+//   1 = no reproduce nada (linea base, para descartar la musica y el ambiente)
+//   2 = reproduce MIDNA_JUMP y anota que muestras de audio se piden
+//   3 = reproduce TITLE_ENTER y anota lo mismo
 // Hazlo parado en un lugar tranquilo, sin enemigos. El resultado sale en el registro del mod.
 #if AUDIO_SCAN
 static const int SCAN_TICKS = 20;
-static std::mutex g_scanMutex;
-static std::set<std::pair<uintptr_t, uint32_t>> g_scanSeen;   // (banco, id de muestra)
-static std::atomic<bool> g_scanActive{false};
+static const int SCAN_MAX = 512;
+struct ScanEntry { uintptr_t bank; uint32_t id; };
+static ScanEntry g_scanBuf[SCAN_MAX];        // (banco, id de muestra) sin repetir
+static volatile int g_scanCount = 0;
+static volatile bool g_scanActive = false;
 static int g_scanTicks = 0;
+static int g_scanStep = 0;
 static const char* g_scanLabel = "";
 
+// Puede llamarse desde el hilo de audio; como es solo una herramienta de diagnostico,
+// no usa candados (un choque raro solo perderia un dato).
 static HookAction on_scan_wave(ModContext*, void* args, void*, void*) {
-    if (!g_scanActive.load()) return HOOK_CONTINUE;
+    if (!g_scanActive) return HOOK_CONTINUE;
     uintptr_t bank = (uintptr_t)mods::arg<void*>(args, 0);
     uint32_t id = mods::arg<uint32_t>(args, 1);
-    std::lock_guard<std::mutex> lock(g_scanMutex);
-    g_scanSeen.insert({bank, id});
+    int n = g_scanCount;
+    for (int i = 0; i < n; i++) {
+        if (g_scanBuf[i].bank == bank && g_scanBuf[i].id == id) return HOOK_CONTINUE;
+    }
+    if (n < SCAN_MAX) {
+        g_scanBuf[n].bank = bank;
+        g_scanBuf[n].id = id;
+        g_scanCount = n + 1;
+    }
     return HOOK_CONTINUE;
 }
 
 static void scan_start(daAlink_c* link, const char* label, bool playMidna, bool playTitle) {
-    {
-        std::lock_guard<std::mutex> lock(g_scanMutex);
-        g_scanSeen.clear();
-    }
+    g_scanCount = 0;
     g_scanLabel = label;
     g_scanTicks = SCAN_TICKS;
-    g_scanActive.store(true);
+    g_scanActive = true;
     if (playMidna) link->setPlayerSe(Z2SE_MIDNA_JUMP);
     if (playTitle) link->setPlayerSe(Z2SE_TITLE_ENTER);
 }
 
 static void scan_tick(daAlink_c* link) {
-    if (g_scanTicks == 0 && mDoCPd_c::getHoldR(PAD_1)) {
-        if (mDoCPd_c::getTrigZ(PAD_1)) scan_start(link, "MIDNA_JUMP", true, false);
-        else if (mDoCPd_c::getTrigY(PAD_1)) scan_start(link, "TITLE_ENTER", false, true);
-        else if (mDoCPd_c::getTrigX(PAD_1)) scan_start(link, "NADA (base)", false, false);
+    // Un solo boton: R mantenido + Y. Cada pulsacion avanza: base -> MIDNA_JUMP -> TITLE_ENTER -> base...
+    if (g_scanTicks == 0 && mDoCPd_c::getHoldR(PAD_1) && mDoCPd_c::getTrigY(PAD_1)) {
+        int step = g_scanStep++ % 3;
+        if (step == 0) scan_start(link, "1-NADA (base)", false, false);
+        else if (step == 1) scan_start(link, "2-MIDNA_JUMP", true, false);
+        else scan_start(link, "3-TITLE_ENTER", false, true);
     }
     if (g_scanTicks > 0 && --g_scanTicks == 0) {
-        g_scanActive.store(false);
+        g_scanActive = false;
         std::map<uintptr_t, std::vector<uint32_t>> banks;
-        {
-            std::lock_guard<std::mutex> lock(g_scanMutex);
-            for (auto& p : g_scanSeen) banks[p.first].push_back(p.second);
-        }
+        int count = g_scanCount;
+        for (int i = 0; i < count; i++) banks[g_scanBuf[i].bank].push_back(g_scanBuf[i].id);
         char head[96];
         snprintf(head, sizeof(head), "SCAN [%s]: %d banco(s)", g_scanLabel, (int)banks.size());
         svc_log->info(mod_ctx, head);
