@@ -11,6 +11,7 @@
 //   solo se puede golpear al enemigo cuando queda aturdido (barra llena).
 
 #define ENABLE_BAR 1   // 1 = dibuja la barra sobre el enemigo, 0 = sin barra (solo sonidos)
+#define AUDIO_SCAN 1   // 1 = herramienta para encontrar el ID del sonido (temporal), 0 = apagada
 
 #include <unordered_map>
 #include <vector>
@@ -31,6 +32,18 @@
 #include "d/d_drawlist.h"
 #include "m_Do/m_Do_lib.h"
 #include <dolphin/gx.h>
+#endif
+
+#if AUDIO_SCAN
+#include <mutex>
+#include <set>
+#include <map>
+#include <string>
+#include <cstdio>
+#include <atomic>
+#include "JSystem/JAudio2/JASWaveBank.h"
+#include "JSystem/JAudio2/JASBasicWaveBank.h"
+#include "JSystem/JAudio2/JASSimpleWaveBank.h"
 #endif
 
 DEFINE_MOD();
@@ -57,6 +70,10 @@ DEFINE_HOOK(&daAlink_c::procCutLargeJumpInit, CutLargeJumpInit);
 DEFINE_HOOK(&daAlink_c::setCutDash, CutDash);
 #if ENABLE_BAR
 DEFINE_HOOK(&daAlink_c::draw, LinkDraw);
+#endif
+#if AUDIO_SCAN
+DEFINE_HOOK(&JASBasicWaveBank::getWaveHandle, ScanBasicWave);
+DEFINE_HOOK(&JASSimpleWaveBank::getWaveHandle, ScanSimpleWave);
 #endif
 
 // ---- Ajustes (ticks de logica: 30 por segundo) ----
@@ -189,12 +206,81 @@ static void on_shield_guard_post(ModContext*, void* args, void*, void*) {
     GuardHelper::remove_auto_guard(mods::arg<daAlink_c*>(args, 0));
 }
 
+// ======================= HERRAMIENTA: BUSCAR ID DE SONIDO =======================
+// Temporal. Mantener R y presionar:
+//   Z = reproduce el sonido MIDNA_JUMP y anota que muestras de audio se piden
+//   Y = reproduce el sonido TITLE_ENTER y anota lo mismo
+//   X = no reproduce nada (linea base, para descartar la musica y el ambiente)
+// Hazlo parado en un lugar tranquilo, sin enemigos. El resultado sale en el registro del mod.
+#if AUDIO_SCAN
+static const int SCAN_TICKS = 20;
+static std::mutex g_scanMutex;
+static std::set<std::pair<uintptr_t, uint32_t>> g_scanSeen;   // (banco, id de muestra)
+static std::atomic<bool> g_scanActive{false};
+static int g_scanTicks = 0;
+static const char* g_scanLabel = "";
+
+static HookAction on_scan_wave(ModContext*, void* args, void*, void*) {
+    if (!g_scanActive.load()) return HOOK_CONTINUE;
+    uintptr_t bank = (uintptr_t)mods::arg<void*>(args, 0);
+    uint32_t id = mods::arg<uint32_t>(args, 1);
+    std::lock_guard<std::mutex> lock(g_scanMutex);
+    g_scanSeen.insert({bank, id});
+    return HOOK_CONTINUE;
+}
+
+static void scan_start(daAlink_c* link, const char* label, bool playMidna, bool playTitle) {
+    {
+        std::lock_guard<std::mutex> lock(g_scanMutex);
+        g_scanSeen.clear();
+    }
+    g_scanLabel = label;
+    g_scanTicks = SCAN_TICKS;
+    g_scanActive.store(true);
+    if (playMidna) link->setPlayerSe(Z2SE_MIDNA_JUMP);
+    if (playTitle) link->setPlayerSe(Z2SE_TITLE_ENTER);
+}
+
+static void scan_tick(daAlink_c* link) {
+    if (g_scanTicks == 0 && mDoCPd_c::getHoldR(PAD_1)) {
+        if (mDoCPd_c::getTrigZ(PAD_1)) scan_start(link, "MIDNA_JUMP", true, false);
+        else if (mDoCPd_c::getTrigY(PAD_1)) scan_start(link, "TITLE_ENTER", false, true);
+        else if (mDoCPd_c::getTrigX(PAD_1)) scan_start(link, "NADA (base)", false, false);
+    }
+    if (g_scanTicks > 0 && --g_scanTicks == 0) {
+        g_scanActive.store(false);
+        std::map<uintptr_t, std::vector<uint32_t>> banks;
+        {
+            std::lock_guard<std::mutex> lock(g_scanMutex);
+            for (auto& p : g_scanSeen) banks[p.first].push_back(p.second);
+        }
+        char head[96];
+        snprintf(head, sizeof(head), "SCAN [%s]: %d banco(s)", g_scanLabel, (int)banks.size());
+        svc_log->info(mod_ctx, head);
+        int n = 0;
+        for (auto& kv : banks) {
+            std::string line = "SCAN [" + std::string(g_scanLabel) + "] banco " + std::to_string(++n) +
+                               " (" + std::to_string(kv.second.size()) + " ids):";
+            int shown = 0;
+            for (uint32_t id : kv.second) {
+                if (shown++ >= 80) { line += " ..."; break; }
+                line += " " + std::to_string(id);
+            }
+            svc_log->info(mod_ctx, line.c_str());
+        }
+    }
+}
+#endif  // AUDIO_SCAN
+
 // Cada tick de Link.
 static HookAction on_execute_pre(ModContext*, void* args, void*, void*) {
     daAlink_c* link = mods::arg<daAlink_c*>(args, 0);
 
     if (g_parryTimer > 0) g_parryTimer--;
     if (g_attackLock > 0) g_attackLock--;
+#if AUDIO_SCAN
+    scan_tick(link);
+#endif
 
     // Actualizar enemigos: limpiar muertos, mantener quietos a los aturdidos.
     for (auto it = g_enemies.begin(); it != g_enemies.end();) {
@@ -436,6 +522,13 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
 #if ENABLE_BAR
     if ((r = mods::hook::add_post<LinkDraw>(on_link_draw_post)) != MOD_OK)
         return mods::set_error(error, r, "hook dibujo de Link");
+#endif
+#if AUDIO_SCAN
+    // Si alguno falla, solo avisa: el resto del mod sigue funcionando.
+    if (mods::hook::add_pre<ScanBasicWave>(on_scan_wave) != MOD_OK)
+        svc_log->warn(mod_ctx, "SCAN: no pude hookear JASBasicWaveBank");
+    if (mods::hook::add_pre<ScanSimpleWave>(on_scan_wave) != MOD_OK)
+        svc_log->warn(mod_ctx, "SCAN: no pude hookear JASSimpleWaveBank");
 #endif
     return MOD_OK;
 }
