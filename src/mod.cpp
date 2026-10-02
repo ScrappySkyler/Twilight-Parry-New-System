@@ -7,6 +7,8 @@
 // - Tras los tajos (o si se acaba el tiempo) la barra se reinicia.
 // - La barra se muestra sobre el enemigo fijado con Z.
 // - Sin escudo automatico al fijar enemigos.
+// - Tras un parry que no llena la barra, Link no puede atacar con la espada un rato:
+//   solo se puede golpear al enemigo cuando queda aturdido (barra llena).
 
 #define ENABLE_BAR 1   // 1 = dibuja la barra sobre el enemigo, 0 = sin barra (solo sonidos)
 
@@ -42,6 +44,17 @@ DEFINE_HOOK(&daAlink_c::procGuardSlipInit, GuardSlipInit);
 DEFINE_HOOK(&daAlink_c::procGuardBreakInit, GuardBreakInit);
 DEFINE_HOOK(&daAlink_c::setSmallGuard, SmallGuard);
 DEFINE_HOOK(&daAlink_c::setShieldGuard, ShieldGuard);
+// Ataques con espada que se bloquean tras un parry
+DEFINE_HOOK(&daAlink_c::procCutNormalInit, CutNormalInit);
+DEFINE_HOOK(&daAlink_c::procCutFinishInit, CutFinishInit);
+DEFINE_HOOK(&daAlink_c::procCutJumpInit, CutJumpInit);
+DEFINE_HOOK(&daAlink_c::procCutTurnInit, CutTurnInit);
+DEFINE_HOOK(&daAlink_c::procCutTurnChargeInit, CutTurnChargeInit);
+DEFINE_HOOK(&daAlink_c::procCutDownInit, CutDownInit);
+DEFINE_HOOK(&daAlink_c::procCutHeadInit, CutHeadInit);
+DEFINE_HOOK(&daAlink_c::procCutLargeJumpChargeInit, CutLargeJumpChargeInit);
+DEFINE_HOOK(&daAlink_c::procCutLargeJumpInit, CutLargeJumpInit);
+DEFINE_HOOK(&daAlink_c::setCutDash, CutDash);
 #if ENABLE_BAR
 DEFINE_HOOK(&daAlink_c::draw, LinkDraw);
 #endif
@@ -52,6 +65,7 @@ static const int PARRIES_TO_STUN = 3;        // parries para llenar la barra
 static const int STUN_TICKS = 120;           // tiempo aturdido para empezar los tajos (4 s)
 static const int SECOND_SLASH_TICKS = 30;    // tiempo para el segundo tajo
 static const int HOLD_AFTER_TICKS = 20;      // enemigo quieto mientras cae el segundo tajo
+static const int ATTACK_LOCK_TICKS = 60;     // sin atacar tras un parry normal (60 = 2 s)
 
 // ---- Ajustes de la barra ----
 static const float BAR_HEIGHT_ABOVE_HEAD = 60.0f;  // altura sobre la cabeza (unidades del juego)
@@ -82,6 +96,8 @@ static std::unordered_map<uint32_t, EnemyState> g_enemies;
 
 static int g_parryTimer = 0;
 static bool g_parryHitThisTick = false;
+static int g_attackLock = 0;        // ticks restantes sin poder atacar
+static bool g_bypassLock = false;   // el propio mod lanza los tajos relampago
 
 static fopAc_ac_c* actor_by_id(uint32_t id) {
     fopAc_ac_c* a = nullptr;
@@ -111,10 +127,12 @@ static HookAction on_guard_se_pre(ModContext*, void* args, void*, void*) {
     g_parryHitThisTick = true;
 
     bool stunnedNow = false;
+    bool lockAttacks = true;
     fopAc_ac_c* target = link->mTargetedActor;
     if (target) {
         EnemyState& st = g_enemies[fopAcM_GetID(target)];
         bool exposed = st.stunTimer > 0 || st.secondTimer > 0 || st.holdTimer > 0;
+        if (exposed) lockAttacks = false;
         if (!exposed) {
             st.parries++;
             if (st.parries >= PARRIES_TO_STUN) {
@@ -124,6 +142,9 @@ static HookAction on_guard_se_pre(ModContext*, void* args, void*, void*) {
             }
         }
     }
+
+    // Parry que no llena la barra: no se puede atacar un rato. Si se lleno, se libera.
+    g_attackLock = (stunnedNow || !lockAttacks) ? 0 : ATTACK_LOCK_TICKS;
 
     link->setPlayerSe(stunnedNow ? Z2SE_TITLE_ENTER : Z2SE_MIDNA_JUMP);
     dComIfGp_getVibration().StartShock(VIBMODE_S_POWER4, 1, cXyz(0.0f, 1.0f, 0.0f));
@@ -136,6 +157,18 @@ static HookAction on_guard_se_pre(ModContext*, void* args, void*, void*) {
 static HookAction skip_if_parry(ModContext*, void*, void* retval, void*) {
     if (!g_parryHitThisTick) return HOOK_CONTINUE;
     if (retval != nullptr) *static_cast<int*>(retval) = 0;
+    return HOOK_SKIP_ORIGINAL;
+}
+
+// Bloquea el inicio de ataques con espada mientras dure el castigo del parry.
+static HookAction block_attack_int(ModContext*, void*, void* retval, void*) {
+    if (g_attackLock <= 0 || g_bypassLock) return HOOK_CONTINUE;
+    if (retval != nullptr) *static_cast<int*>(retval) = 0;
+    return HOOK_SKIP_ORIGINAL;
+}
+
+static HookAction block_attack_void(ModContext*, void*, void*, void*) {
+    if (g_attackLock <= 0 || g_bypassLock) return HOOK_CONTINUE;
     return HOOK_SKIP_ORIGINAL;
 }
 
@@ -161,6 +194,7 @@ static HookAction on_execute_pre(ModContext*, void* args, void*, void*) {
     daAlink_c* link = mods::arg<daAlink_c*>(args, 0);
 
     if (g_parryTimer > 0) g_parryTimer--;
+    if (g_attackLock > 0) g_attackLock--;
 
     // Actualizar enemigos: limpiar muertos, mantener quietos a los aturdidos.
     for (auto it = g_enemies.begin(); it != g_enemies.end();) {
@@ -192,11 +226,15 @@ static HookAction on_execute_pre(ModContext*, void* args, void*, void*) {
             EnemyState& st = it->second;
             if (st.stunTimer > 0) {
                 st.lastWasA = cM_rndF(1.0f) < 0.5f;
+                g_bypassLock = true;
                 link->procCutFinishInit(st.lastWasA ? MORTAL_DRAW_A : MORTAL_DRAW_B);
+                g_bypassLock = false;
                 st.stunTimer = 0;
                 st.secondTimer = SECOND_SLASH_TICKS;
             } else if (st.secondTimer > 0) {
+                g_bypassLock = true;
                 link->procCutFinishInit(st.lastWasA ? MORTAL_DRAW_B : MORTAL_DRAW_A);
+                g_bypassLock = false;
                 st.secondTimer = 0;
                 st.holdTimer = HOLD_AFTER_TICKS;
                 st.parries = 0;                            // barra reiniciada
@@ -371,6 +409,26 @@ MOD_EXPORT ModResult mod_initialize(ModError* error) {
         return mods::set_error(error, r, "hook guardia chica");
     if ((r = mods::hook::add_post<ShieldGuard>(on_shield_guard_post)) != MOD_OK)
         return mods::set_error(error, r, "hook escudo automatico");
+    if ((r = mods::hook::add_pre<CutNormalInit>(block_attack_int)) != MOD_OK)
+        return mods::set_error(error, r, "hook ataque normal");
+    if ((r = mods::hook::add_pre<CutFinishInit>(block_attack_int)) != MOD_OK)
+        return mods::set_error(error, r, "hook tajo final");
+    if ((r = mods::hook::add_pre<CutJumpInit>(block_attack_int)) != MOD_OK)
+        return mods::set_error(error, r, "hook tajo con salto");
+    if ((r = mods::hook::add_pre<CutTurnInit>(block_attack_int)) != MOD_OK)
+        return mods::set_error(error, r, "hook tajo giratorio");
+    if ((r = mods::hook::add_pre<CutTurnChargeInit>(block_attack_int)) != MOD_OK)
+        return mods::set_error(error, r, "hook carga giratoria");
+    if ((r = mods::hook::add_pre<CutDownInit>(block_attack_int)) != MOD_OK)
+        return mods::set_error(error, r, "hook golpe final");
+    if ((r = mods::hook::add_pre<CutHeadInit>(block_attack_int)) != MOD_OK)
+        return mods::set_error(error, r, "hook tajo de casco");
+    if ((r = mods::hook::add_pre<CutLargeJumpChargeInit>(block_attack_int)) != MOD_OK)
+        return mods::set_error(error, r, "hook carga gran giro");
+    if ((r = mods::hook::add_pre<CutLargeJumpInit>(block_attack_int)) != MOD_OK)
+        return mods::set_error(error, r, "hook gran giro");
+    if ((r = mods::hook::add_pre<CutDash>(block_attack_void)) != MOD_OK)
+        return mods::set_error(error, r, "hook ataque en carrera");
     if ((r = mods::hook::add_pre<LinkExecute>(on_execute_pre)) != MOD_OK)
         return mods::set_error(error, r, "hook Link execute");
     if ((r = mods::hook::add_post<LinkExecute>(on_execute_post)) != MOD_OK)
@@ -394,6 +452,8 @@ MOD_EXPORT ModResult mod_shutdown(ModError*) {
 #endif
     g_parryTimer = 0;
     g_parryHitThisTick = false;
+    g_attackLock = 0;
+    g_bypassLock = false;
     return MOD_OK;
 }
 
