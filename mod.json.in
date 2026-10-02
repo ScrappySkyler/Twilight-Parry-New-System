@@ -1,7 +1,7 @@
 {
   "id": "com.usuario.parry",
-  "name": "Parry Bar",
-  "version": "0.2.0",
-  "author": "Tu nombre",
-  "description": "Sistema de parry estilo Sekiro. Empuja el escudo justo antes del golpe enemigo para hacer parry: el enemigo sigue atacando, pero una barra blanca sobre su cabeza sube con cada parry. Al llenarse (3 parries) queda aturdido y puedes encadenar dos tajos relampago (Mortal Draw) con B; despues la barra se reinicia. Quita el escudo automatico al fijar enemigos (mantener R + Z para activarlo o desactivarlo)."
+  "name": "Twilight Parry",
+  "version": "1.0.0",
+  "author": "ScrappySkyler",
+  "description": "Parry system: This mod disables auto-blocking for greater immersion. The parry is activated by pressing the R trigger (shield bash). The enemy will then be stunned, allowing you to follow up with a maximum of two Mortal Draws."
 }
